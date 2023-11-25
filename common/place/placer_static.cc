@@ -48,6 +48,7 @@ namespace {
 
 struct PlacerGroup
 {
+    bool enabled = true;
     int total_bels = 0;
     double concrete_area = 0;
     double dark_area = 0;
@@ -62,6 +63,9 @@ struct PlacerGroup
     FFTArray density_fft;
     FFTArray electro_phi;
     FFTArray electro_fx, electro_fy;
+    // potential energy
+    float initial_potential = 0;
+    float curr_potential = 0;
 };
 
 // Could be an actual concrete netlist cell; or just a spacer
@@ -750,28 +754,20 @@ class StaticPlacer
         }
         if (init_penalty) {
             // set initial density penalty
-            dict<int, float> wirelen_sum;
-            dict<int, float> force_sum;
+            float wirelen_sum = 0, force_sum = 0;
             for (auto &cell : ctx->cells) {
                 CellInfo *ci = cell.second.get();
                 if (ci->udata == -1)
                     continue;
                 auto &mc = mcells.at(ci->udata);
-                auto res1 = wirelen_sum.insert({mc.group, std::abs(mc.ref_wl_grad.x) + std::abs(mc.ref_wl_grad.y)});
-                if (!res1.second)
-                    res1.first->second += std::abs(mc.ref_wl_grad.x) + std::abs(mc.ref_wl_grad.y);
-                auto res2 = force_sum.insert({mc.group, std::abs(mc.ref_dens_grad.x) + std::abs(mc.ref_dens_grad.y)});
-                if (!res2.second)
-                    res2.first->second += std::abs(mc.ref_dens_grad.x) + std::abs(mc.ref_dens_grad.y);
+                wirelen_sum += std::abs(mc.ref_wl_grad.x) + std::abs(mc.ref_wl_grad.y);
+                force_sum += std::abs(mc.ref_dens_grad.x) + std::abs(mc.ref_dens_grad.y);
             }
-            dens_penalty = std::vector<float>(wirelen_sum.size(), 0.0);
-            for (auto &item : wirelen_sum) {
-                auto group = item.first;
-                auto wirelen = item.second;
-                dens_penalty[group] = wirelen / force_sum.at(group);
-                log_info(" initial density penalty for %s: %f\n", cfg.cell_groups.at(group).name.c_str(ctx),
-                         dens_penalty[group]);
-            }
+            const float eta = 1e-4;
+            float init_dens_penalty = eta * (wirelen_sum / force_sum); 
+            log_info("initial density penalty: %f\n", init_dens_penalty);
+            dens_penalty.resize(groups.size(), init_dens_penalty);
+            update_potentials(true); // set initial potential
         }
         // Third loop: compute total gradient, and precondition
         // TODO: ALM as well as simple penalty
@@ -834,13 +830,28 @@ class StaticPlacer
         return hpwl;
     }
 
-    float system_potential()
+    void update_potentials(bool init = false)
     {
-        float pot = 0;
+        for (auto &group : groups) {
+            group.curr_potential = 0;
+        }
         for (auto &cell : mcells) {
             auto &g = groups.at(cell.group);
             iter_slithers(cell.ref_pos, cell.rect,
-                          [&](int x, int y, float area) { pot += g.electro_phi.at(x, y) * area; });
+                          [&](int x, int y, float area) { g.curr_potential += g.electro_phi.at(x, y) * area; });
+        }
+        if (init) {
+            for (auto &group : groups) {
+                group.initial_potential = group.curr_potential;
+            }
+        }
+    }
+
+    float system_potential()
+    {
+        float pot = 0;
+        for (auto &group : groups) {
+            pot += group.curr_potential;
         }
         return pot;
     }
@@ -917,6 +928,35 @@ class StaticPlacer
         }
     }
 
+    float penalty_beta = 2.0e3f;
+    float alpha_l = 1.05f, alpha_h = 1.06f;
+    double penalty_incr = alpha_h - 1;
+
+    void update_penalties() {
+        float pot_norm = 0;
+        // compute L2-norm of relative system potential
+        std::vector<float> rel_pot;
+        for (int g = 0; g < int(groups.size()); g++) {
+            auto &group = groups.at(g);
+            if (!group.enabled)
+               continue;
+            float phi_hat = group.curr_potential / group.initial_potential;
+            rel_pot.push_back(phi_hat);
+            pot_norm += phi_hat * phi_hat;
+        }
+        pot_norm = sqrt(pot_norm);
+        // update penalty multiplier (ELFPlace equation 22)
+        double log_term = std::log(penalty_beta * pot_norm + 1);
+        penalty_incr = penalty_incr * ((log_term  / (log_term + 1)) * (alpha_h - alpha_l) + alpha_l);
+        // update density penalties (ELFPlace equation 21)
+        for (int g = 0; g < int(groups.size()); g++) {
+            if (!groups.at(g).enabled)
+                 continue;
+            float next_penalty = dens_penalty.at(g) + (penalty_incr * (rel_pot.at(g) / pot_norm));
+            dens_penalty.at(g) = next_penalty;
+        }
+    }
+
     void step()
     {
         // TODO: update penalties; wirelength factor; etc
@@ -938,6 +978,7 @@ class StaticPlacer
         nesterov_a = a_next;
         update_chains();
         update_gradients(true);
+        update_potentials();
         log_info("   system potential: %f hpwl: %f\n", system_potential(), system_hpwl());
         compute_overlap();
     }
@@ -1245,6 +1286,7 @@ class StaticPlacer
         }
     }
 
+
   public:
     StaticPlacer(Context *ctx, PlacerStaticCfg cfg) : ctx(ctx), cfg(cfg), fast_bels(ctx, true, 8), tmg(ctx)
     {
@@ -1265,20 +1307,25 @@ class StaticPlacer
         bool legalised_ip = false;
         while (true) {
             step();
-            for (auto &penalty : dens_penalty)
-                penalty *= 1.025;
+            // for (auto &penalty : dens_penalty)
+            //   penalty *= 1.025;
+            update_penalties();
+
+            float logic_overlap = 0;
+            for (int i = 0; i < 2; i++)
+                logic_overlap = std::max(logic_overlap, groups.at(i).overlap);
+
             if (!legalised_ip) {
                 float ip_overlap = 0;
                 for (int i = 2; i < int(groups.size()); i++)
                     ip_overlap = std::max(ip_overlap, groups.at(i).overlap);
-                if (ip_overlap < 0.15) {
+                if (logic_overlap < 0.15 && ip_overlap < 0.15) {
                     legalise_step(true);
                     legalised_ip = true;
+                    for (int i = 2; i < int(groups.size()); i++)
+                        groups.at(i).enabled = false;
                 }
             } else {
-                float logic_overlap = 0;
-                for (int i = 0; i < 2; i++)
-                    logic_overlap = std::max(logic_overlap, groups.at(i).overlap);
                 if (logic_overlap < 0.1) {
                     legalise_step(false);
                     break;
